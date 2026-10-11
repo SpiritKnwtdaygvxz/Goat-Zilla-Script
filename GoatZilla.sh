@@ -1,13 +1,14 @@
 
 #!/usr/bin/env bash
-# ============================================
-#          ZILLA GOAT SCRIPT
-#      Linux Hosting Optimization Tool
-# ============================================
+# =========================================================
+#                  ZILLA GOAT SCRIPT
+#            Linux Hosting Optimization Tool
+#                         v2.0
+# =========================================================
 
 set -Eeuo pipefail
 
-VERSION="1.0"
+VERSION="2.0"
 SWAP_FILE="/swapfile"
 SYSCTL_FILE="/etc/sysctl.d/99-zilla-goat.conf"
 ZRAM_CONFIG="/etc/default/zramswap"
@@ -30,7 +31,7 @@ pause() {
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "Run this script as root: sudo bash zilla-goat.sh"
+        error "Run as root: sudo bash zilla-goat.sh"
         exit 1
     fi
 }
@@ -45,7 +46,7 @@ check_os() {
     source /etc/os-release
 
     if [[ "${ID:-}" != "ubuntu" && "${ID:-}" != "debian" ]]; then
-        error "This script supports Ubuntu and Debian only."
+        error "Only Ubuntu and Debian are supported."
         exit 1
     fi
 
@@ -53,41 +54,85 @@ check_os() {
         error "APT package manager not found."
         exit 1
     fi
+
+    for cmd in swapon swapoff mkswap sysctl df grep awk; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            error "Required command missing: $cmd"
+            exit 1
+        fi
+    done
 }
 
+# ---------------------------------------------------------
+# ZRAM
+# Preserve provider-configured or already active ZRAM.
+# Never change compression on an existing ZRAM device.
+# ---------------------------------------------------------
+
 install_zram() {
+    info "Checking ZRAM..."
+
+    # Case 1: ZRAM is already active as swap.
+    if swapon --noheadings --raw --show=NAME |
+        grep -Eq '^/dev/zram[0-9]+$'; then
+        success "ZRAM is already active. Keeping existing configuration."
+
+        if command -v zramctl >/dev/null 2>&1; then
+            zramctl || true
+        fi
+
+        return 0
+    fi
+
+    # Case 2: A ZRAM device has already been initialized,
+    # but it is not active as swap. Do not reset it blindly.
+    local sysfile size
+    for sysfile in /sys/block/zram*/disksize; do
+        [[ -e "$sysfile" ]] || continue
+        size=$(cat "$sysfile" 2>/dev/null || echo 0)
+
+        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )); then
+            warn "ZRAM device is initialized but not active as swap."
+            warn "Not resetting or reconfiguring it automatically."
+            warn "Inspect with: zramctl && swapon --show"
+            return 1
+        fi
+    done
+
+    info "No active or initialized ZRAM device detected."
     info "Installing ZRAM tools..."
 
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y zram-tools
 
-    # Configure ZRAM to use up to 50% of physical RAM.
-    # ZRAM is compressed memory, not disk-backed swap.
+    # Preserve the existing package configuration.
     if [[ -f "$ZRAM_CONFIG" ]]; then
-        cp -a "$ZRAM_CONFIG" "${ZRAM_CONFIG}.zilla-backup"
+        cp -n "$ZRAM_CONFIG" "${ZRAM_CONFIG}.zilla-backup"
     fi
 
-    cat > "$ZRAM_CONFIG" <<'EOF'
-ALGO=lz4
-PERCENT=50
-PRIORITY=100
-EOF
+    # Do not force an algorithm or overwrite provider settings.
+    if systemctl restart zramswap; then
+        success "ZRAM service started."
 
-    systemctl enable zramswap
-
-    if ! systemctl restart zramswap; then
-        warn "ZRAM service failed. Check: systemctl status zramswap"
+        if command -v zramctl >/dev/null 2>&1; then
+            zramctl || true
+        fi
+    else
+        error "ZRAM service failed."
+        journalctl -u zramswap -n 30 --no-pager || true
         return 1
     fi
-
-    success "ZRAM configured and service started."
 }
+
+# ---------------------------------------------------------
+# SWAPPINESS
+# ---------------------------------------------------------
 
 configure_swappiness() {
     local value="$1"
 
     if [[ ! "$value" =~ ^[0-9]{1,3}$ ]] ||
-       (( value < 0 || value > 200 )); then
+       (( 10#$value > 200 )); then
         error "Swappiness must be an integer from 0 to 200."
         return 1
     fi
@@ -95,51 +140,73 @@ configure_swappiness() {
     mkdir -p /etc/sysctl.d
 
     cat > "$SYSCTL_FILE" <<EOF
-# Zilla Goat Script - persistent swap configuration
-vm.swappiness=$value
+# Zilla Goat Script - persistent configuration
+vm.swappiness=$((10#$value))
 EOF
 
-    sysctl -w "vm.swappiness=$value" >/dev/null
-    success "Swappiness set to $value and saved persistently."
+    if ! sysctl -w "vm.swappiness=$((10#$value))"; then
+        error "Failed to apply swappiness."
+        return 1
+    fi
+
+    success "Swappiness set to $((10#$value)) and saved persistently."
 }
+
+# ---------------------------------------------------------
+# DISK SWAP
+# ---------------------------------------------------------
 
 create_swap() {
     local size_gb="$1"
-    local size_mb
+    local size_mb available_kb
 
-    if [[ ! "$size_gb" =~ ^[0-9]+$ ]] ||
-       (( size_gb < 1 || size_gb > 1024 )); then
-        error "Enter a whole number between 1 and 1024 GB."
+    if [[ ! "$size_gb" =~ ^[0-9]{1,4}$ ]] ||
+       (( 10#$size_gb < 1 || 10#$size_gb > 1024 )); then
+        error "Swap size must be between 1 and 1024 GB."
         return 1
     fi
 
+    size_gb=$((10#$size_gb))
     size_mb=$((size_gb * 1024))
 
-    if swapon --show=NAME --noheadings | grep -Fxq "$SWAP_FILE"; then
+    # If the existing file is already active, leave it alone.
+    if swapon --noheadings --raw --show=NAME |
+        grep -Fxq "$SWAP_FILE"; then
         warn "$SWAP_FILE is already active. Leaving it unchanged."
+        swapon --show
         return 0
     fi
 
+    # Never overwrite a pre-existing file.
     if [[ -e "$SWAP_FILE" ]]; then
-        warn "$SWAP_FILE already exists. Refusing to overwrite it."
-        warn "Inspect it manually with: ls -lh $SWAP_FILE"
+        warn "$SWAP_FILE already exists but is not active."
+        warn "Inspect it manually before deciding what to do."
         return 1
     fi
 
-    local available_kb
-    available_kb=$(df -Pk / | awk 'NR==2 {print $4}')
+    available_kb=$(df -Pk "$(dirname "$SWAP_FILE")" |
+        awk 'NR==2 {print $4}')
 
-    if (( available_kb < size_mb * 1024 + 1048576 )); then
-        error "Not enough free space on /. Leave at least 1 GB free."
+    if [[ ! "$available_kb" =~ ^[0-9]+$ ]] ||
+       (( available_kb < size_mb * 1024 + 1048576 )); then
+        error "Insufficient free disk space. Leave at least 1 GB free."
         return 1
     fi
 
-    info "Creating a ${size_gb} GB swap file..."
+    info "Creating ${size_gb} GB disk swap..."
 
+    # Create file. Fall back to dd if fallocate is unsupported.
     if ! fallocate -l "${size_gb}G" "$SWAP_FILE"; then
+        warn "fallocate failed; trying dd. This may take longer."
+
         rm -f "$SWAP_FILE"
-        error "Could not allocate swap file."
-        return 1
+
+        if ! dd if=/dev/zero of="$SWAP_FILE" \
+            bs=1M count="$size_mb" status=progress conv=fsync; then
+            rm -f "$SWAP_FILE"
+            error "Could not create swap file."
+            return 1
+        fi
     fi
 
     chmod 600 "$SWAP_FILE"
@@ -152,37 +219,75 @@ create_swap() {
 
     if ! swapon "$SWAP_FILE"; then
         rm -f "$SWAP_FILE"
-        error "Could not enable swap file."
+        error "Could not activate swap file."
         return 1
     fi
 
-    if ! grep -Eq '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
-        echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
+    # Avoid duplicate fstab entries.
+    if ! awk '$1 == "/swapfile" {found=1} END {exit !found}' \
+        /etc/fstab; then
+        if ! printf '%s\n' "$SWAP_FILE none swap sw 0 0" >> /etc/fstab; then
+            warn "Could not update /etc/fstab; swap is active for now."
+            return 1
+        fi
     fi
 
-    success "${size_gb} GB swap file created and enabled."
+    success "${size_gb} GB disk swap created and enabled."
 }
 
-auto_optimize() {
-    local ram_gb
+# ---------------------------------------------------------
+# INPUT VALIDATION
+# ---------------------------------------------------------
 
-    echo
-    echo "Enter the server's RAM amount in GB."
-    echo "The disk swap file will be the same size."
-    echo "Example: 8 means 8 GB RAM and an 8 GB swap file."
-    echo
+read_swap_size() {
+    local prompt="$1"
+    local value
 
-    read -rp "RAM amount (GB): " ram_gb
+    read -rp "$prompt" value
 
-    if [[ ! "$ram_gb" =~ ^[0-9]+$ ]] ||
-       (( ram_gb < 1 || ram_gb > 1024 )); then
-        error "Enter a whole number between 1 and 1024."
+    if [[ ! "$value" =~ ^[0-9]{1,4}$ ]] ||
+       (( 10#$value < 1 || 10#$value > 1024 )); then
+        error "Enter a whole number from 1 to 1024."
         return 1
     fi
 
+    REPLY=$((10#$value))
+}
+
+read_swappiness() {
+    local value
+
+    read -rp "Swappiness (0-200): " value
+
+    if [[ ! "$value" =~ ^[0-9]{1,3}$ ]] ||
+       (( 10#$value > 200 )); then
+        error "Enter a whole number from 0 to 200."
+        return 1
+    fi
+
+    REPLY=$((10#$value))
+}
+
+# ---------------------------------------------------------
+# OPTIMIZATION MODES
+# ---------------------------------------------------------
+
+auto_optimize() {
+    local swap_gb
+
     echo
-    warn "This will install ZRAM and create a ${ram_gb} GB disk swap file."
-    warn "It will also set vm.swappiness=150."
+    echo "Default swappiness: 150"
+    echo "Choose disk swap size in GB."
+    echo "Enter your desired swap size; it need not equal RAM."
+    echo
+
+    read_swap_size "Disk swap size (GB): " || return 1
+    swap_gb="$REPLY"
+
+    echo
+    warn "ZRAM will be preserved if already active."
+    warn "Disk swap target: ${swap_gb} GB"
+    warn "Swappiness: 150"
     read -rp "Continue? [y/N]: " confirm
 
     [[ "$confirm" =~ ^[Yy]$ ]] || {
@@ -191,34 +296,26 @@ auto_optimize() {
     }
 
     install_zram || return 1
-    create_swap "$ram_gb" || return 1
+    create_swap "$swap_gb" || return 1
     configure_swappiness 150 || return 1
 
-    success "Zilla Goat optimization completed!"
+    success "Zilla Goat optimization completed."
 }
 
 custom_optimize() {
-    local ram_gb swappiness
+    local swap_gb swap_value
 
     echo
-    read -rp "RAM amount in GB (swap file will match): " ram_gb
-    read -rp "Custom swappiness (0-200): " swappiness
+    read_swap_size "Disk swap size (GB): " || return 1
+    swap_gb="$REPLY"
 
-    if [[ ! "$ram_gb" =~ ^[0-9]+$ ]] ||
-       (( ram_gb < 1 || ram_gb > 1024 )); then
-        error "Invalid RAM amount."
-        return 1
-    fi
-
-    if [[ ! "$swappiness" =~ ^[0-9]+$ ]] ||
-       (( swappiness > 200 )); then
-        error "Swappiness must be from 0 to 200."
-        return 1
-    fi
+    read_swappiness || return 1
+    swap_value="$REPLY"
 
     echo
-    warn "This will install ZRAM, create a ${ram_gb} GB swap file,"
-    warn "and configure swappiness to ${swappiness}."
+    warn "ZRAM will be preserved if already active."
+    warn "Disk swap target: ${swap_gb} GB"
+    warn "Swappiness: ${swap_value}"
     read -rp "Continue? [y/N]: " confirm
 
     [[ "$confirm" =~ ^[Yy]$ ]] || {
@@ -227,39 +324,77 @@ custom_optimize() {
     }
 
     install_zram || return 1
-    create_swap "$ram_gb" || return 1
-    configure_swappiness "$swappiness" || return 1
+    create_swap "$swap_gb" || return 1
+    configure_swappiness "$swap_value" || return 1
 
-    success "Custom optimization completed!"
+    success "Custom optimization completed."
 }
+
+zram_only() {
+    echo
+    warn "This option only checks or installs ZRAM."
+    warn "It will not create a disk swap file."
+    read -rp "Continue? [y/N]: " confirm
+
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+
+    install_zram
+}
+
+# ---------------------------------------------------------
+# STATUS
+# ---------------------------------------------------------
 
 show_status() {
     echo
     echo "========== ZILLA GOAT STATUS =========="
     echo
+
+    echo "--- Operating system ---"
+    if [[ -r /etc/os-release ]]; then
+        grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release || true
+    fi
+
+    echo
     echo "--- Memory ---"
     free -h
+
     echo
     echo "--- Swap devices ---"
     swapon --show
+
     echo
-    echo "--- Current swappiness ---"
+    echo "--- Swappiness ---"
     sysctl vm.swappiness
-    echo
-    echo "--- ZRAM service ---"
-    systemctl --no-pager --full status zramswap 2>/dev/null \
-        | head -n 12 || true
+
     echo
     echo "--- ZRAM devices ---"
-
     if command -v zramctl >/dev/null 2>&1; then
         zramctl || true
     else
         echo "zramctl is not installed."
     fi
+
+    echo
+    echo "--- ZRAM service ---"
+    systemctl --no-pager --full status zramswap 2>/dev/null |
+        head -n 12 || true
+
+    echo
+    echo "--- Persistent swappiness configuration ---"
+    if [[ -f "$SYSCTL_FILE" ]]; then
+        cat "$SYSCTL_FILE"
+    else
+        echo "Zilla Goat configuration file not found."
+    fi
+
     echo
     echo "======================================="
 }
+
+# ---------------------------------------------------------
+# MAIN MENU
+# ---------------------------------------------------------
 
 main_menu() {
     while true; do
@@ -274,25 +409,46 @@ main_menu() {
 /_____|      |__/         |____/ \___/ \__,_|\__|
 
              ZILLA GOAT SCRIPT
-             Hosting Optimizer
+              Hosting Optimizer
 EOF
         echo -e "${RESET}"
+
         echo "Version: $VERSION"
         echo
         echo "1. Auto Optimize (Swappiness 150)"
         echo "2. Custom Swappiness"
-        echo "3. Check System Status"
-        echo "4. Exit"
+        echo "3. ZRAM Setup / Check Only"
+        echo "4. Check System Status"
+        echo "5. Exit"
         echo
 
-        read -rp "Select an option [1-4]: " choice
+        read -rp "Select an option [1-5]: " choice
 
         case "$choice" in
-            1) auto_optimize || warn "Operation incomplete."; pause ;;
-            2) custom_optimize || warn "Operation incomplete."; pause ;;
-            3) show_status; pause ;;
-            4) echo "Thanks for using Zilla Goat!"; exit 0 ;;
-            *) error "Invalid option."; sleep 1 ;;
+            1)
+                auto_optimize || warn "Operation incomplete; check the messages above."
+                pause
+                ;;
+            2)
+                custom_optimize || warn "Operation incomplete; check the messages above."
+                pause
+                ;;
+            3)
+                zram_only || warn "ZRAM operation incomplete; check the messages above."
+                pause
+                ;;
+            4)
+                show_status
+                pause
+                ;;
+            5)
+                echo "Thanks for using Zilla Goat!"
+                exit 0
+                ;;
+            *)
+                error "Invalid option."
+                sleep 1
+                ;;
         esac
     done
 }
