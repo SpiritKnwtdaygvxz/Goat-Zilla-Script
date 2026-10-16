@@ -3,11 +3,11 @@
 set -Eeuo pipefail
 
 # ============================================================
-# Zilla Goat Script v3.1
-# Ubuntu / Debian VPS Swap and ZRAM Manager
+# ZILLA GOAT SCRIPT v3.2
+# Ubuntu / Debian Swap, ZRAM and Swappiness Manager
 # ============================================================
 
-VERSION="3.1"
+VERSION="3.2"
 SWAPFILE="/swapfile"
 SYSCTL_FILE="/etc/sysctl.d/99-zilla-goat.conf"
 ZRAM_CONFIG="/etc/default/zramswap"
@@ -29,19 +29,13 @@ pause() {
 }
 
 require_root() {
-    if [[ "$EUID" -ne 0 ]]; then
-        error "Run this script as root: sudo bash $0"
+    if (( EUID != 0 )); then
+        error "Run as root: sudo bash $0"
         exit 1
     fi
 }
 
 check_os() {
-    if [[ ! -r /etc/os-release ]]; then
-        error "Cannot identify operating system."
-        exit 1
-    fi
-
-    # shellcheck disable=SC1091
     source /etc/os-release
 
     case "${ID:-}" in
@@ -57,12 +51,6 @@ get_ram_kb() {
     awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo
 }
 
-get_ram_gb_ceil() {
-    local ram_kb
-    ram_kb=$(get_ram_kb)
-    echo $(( (ram_kb + 1048575) / 1048576 ))
-}
-
 install_zram_tools() {
     if ! command -v zramswap >/dev/null 2>&1; then
         info "Installing zram-tools..."
@@ -70,33 +58,46 @@ install_zram_tools() {
         DEBIAN_FRONTEND=noninteractive apt-get install -y zram-tools
     fi
 
-    if [[ ! -f "$ZRAM_CONFIG" ]]; then
-        touch "$ZRAM_CONFIG"
-    fi
+    mkdir -p /etc/default
+    touch "$ZRAM_CONFIG"
 }
 
+# Replace active or commented values for one config key.
+# Other settings, including ALGO and PRIORITY, are preserved.
 set_config_value() {
     local key="$1"
     local value="$2"
     local file="$3"
+    local tmp
 
-    if grep -Eq "^[[:space:]]*${key}=" "$file"; then
-        sed -i -E \
-            "s|^[[:space:]]*${key}=.*|${key}=${value}|" "$file"
-    else
-        printf '%s=%s\n' "$key" "$value" >> "$file"
-    fi
+    tmp=$(mktemp)
+
+    awk -v key="$key" '
+        {
+            line=$0
+            testline=line
+            sub(/^[[:space:]]*/, "", testline)
+            sub(/^#[[:space:]]*/, "", testline)
+
+            if (testline ~ ("^" key "[[:space:]]*=")) next
+            print line
+        }
+    ' "$file" > "$tmp"
+
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
 }
 
 configure_swappiness() {
     local value="$1"
 
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value < 0 || value > 200 )); then
+    if ! [[ "$value" =~ ^[0-9]+$ ]] ||
+       (( value < 0 || value > 200 )); then
         error "Swappiness must be between 0 and 200."
         return 1
     fi
 
-    mkdir -p /etc/sysctl.d
     printf 'vm.swappiness = %s\n' "$value" > "$SYSCTL_FILE"
 
     if ! sysctl -w "vm.swappiness=$value" >/dev/null; then
@@ -104,47 +105,40 @@ configure_swappiness() {
         return 1
     fi
 
-    success "Swappiness set to $value and saved permanently."
+    success "Swappiness set to $value."
 }
 
 configure_disk_swap() {
     local size_gb="$1"
-    local available_kb required_kb
+    local available_kb old_kb=0 required_kb
 
-    if ! [[ "$size_gb" =~ ^[0-9]+$ ]] || (( size_gb < 1 )); then
-        error "Swap size must be at least 1 GB."
+    if ! [[ "$size_gb" =~ ^[0-9]+$ ]] ||
+       (( size_gb < 1 || size_gb > 4096 )); then
+        error "Disk swap size must be between 1 and 4096 GB."
         return 1
     fi
 
-    if (( size_gb > 4096 )); then
-        error "Swap size cannot exceed 4096 GB."
+    available_kb=$(df -Pk / | awk 'NR==2 {print $4}')
+    required_kb=$((size_gb * 1048576))
+
+    if [[ -f "$SWAPFILE" ]]; then
+        old_kb=$(du -sk "$SWAPFILE" 2>/dev/null | awk '{print $1}')
+        old_kb=${old_kb:-0}
+        available_kb=$((available_kb + old_kb))
+    fi
+
+    if (( available_kb < required_kb )); then
+        error "Not enough disk space for ${size_gb} GB swap."
         return 1
     fi
 
-    # Refuse to destroy an existing swapfile if it cannot be
-    # safely disabled.
     if swapon --noheadings --raw --output=NAME 2>/dev/null |
-        grep -Fxq "$SWAPFILE"; then
-        info "Disabling existing disk swap..."
+       grep -Fxq "$SWAPFILE"; then
+        info "Disabling current disk swap..."
         if ! swapoff "$SWAPFILE"; then
             error "Could not disable $SWAPFILE. No changes made."
             return 1
         fi
-    fi
-
-    # Account for space currently occupied by the old swapfile.
-    available_kb=$(df -Pk / | awk 'NR==2 {print $4}')
-    if [[ -e "$SWAPFILE" ]]; then
-        local old_kb
-        old_kb=$(du -sk "$SWAPFILE" 2>/dev/null | awk '{print $1}')
-        available_kb=$((available_kb + ${old_kb:-0}))
-    fi
-
-    required_kb=$((size_gb * 1048576))
-    if (( available_kb < required_kb )); then
-        error "Not enough free disk space for ${size_gb} GB of swap."
-        warn "Available space, including the old swapfile: $((available_kb / 1048576)) GB."
-        return 1
     fi
 
     rm -f "$SWAPFILE"
@@ -156,7 +150,7 @@ configure_disk_swap() {
             bs=1M count=$((size_gb * 1024)) \
             status=progress conv=fsync; then
             rm -f "$SWAPFILE"
-            error "Could not create swapfile."
+            error "Could not create the swapfile."
             return 1
         fi
     fi
@@ -164,17 +158,15 @@ configure_disk_swap() {
     chmod 600 "$SWAPFILE"
 
     if ! mkswap "$SWAPFILE" >/dev/null; then
-        rm -f "$SWAPFILE"
-        error "Could not format swapfile."
+        error "Could not format the swapfile."
         return 1
     fi
 
     if ! swapon "$SWAPFILE"; then
-        error "Could not activate disk swap."
+        error "Could not activate the swapfile."
         return 1
     fi
 
-    # Replace only the swapfile entry; preserve other fstab entries.
     if grep -Fq "$SWAPFILE" /etc/fstab; then
         sed -i "\|$SWAPFILE|d" /etc/fstab
     fi
@@ -184,91 +176,79 @@ configure_disk_swap() {
     success "Disk swap configured: ${size_gb} GB."
 }
 
-configure_zram_gb() {
-    local size_gb="$1"
-    local ram_kb percent dev sysdev active
+# Accept both /dev/zram0 and zram0 naming formats.
+zram_swap_active() {
+    swapon --noheadings --raw --output=NAME 2>/dev/null |
+        awk '$NF ~ /(^|\/)zram[0-9]+$/ { found=1 }
+             END { exit !found }'
+}
 
-    if ! [[ "$size_gb" =~ ^[0-9]+$ ]] ||
-        (( size_gb < 1 || size_gb > 4096 )); then
-        error "ZRAM size must be between 1 and 4096 GB."
+zram_device_exists() {
+    local device
+
+    for device in /sys/block/zram[0-9]*; do
+        [[ -e "$device/disksize" ]] && return 0
+    done
+
+    return 1
+}
+
+configure_zram_percent() {
+    local percent="$1"
+    local device
+
+    if ! [[ "$percent" =~ ^[0-9]+$ ]] ||
+       (( percent < 1 || percent > 400 )); then
+        error "ZRAM percentage must be between 1 and 400."
         return 1
     fi
 
     install_zram_tools
 
-    ram_kb=$(get_ram_kb)
-    if [[ -z "$ram_kb" ]] || (( ram_kb <= 0 )); then
-        error "Could not determine system RAM."
-        return 1
-    fi
+    # Back up the existing configuration.
+    cp -a "$ZRAM_CONFIG" "${ZRAM_CONFIG}.zilla-backup"
 
-    # zram-tools PERCENT is a percentage of physical RAM.
-    # Round upward so the requested size is not rounded down.
-    percent=$(( (size_gb * 104857600 + ram_kb - 1) / ram_kb ))
-
-    if (( percent < 1 )); then
-        percent=1
-    fi
-
-    # Back up the configuration before changing it.
-    if [[ -f "$ZRAM_CONFIG" ]]; then
-        cp -a "$ZRAM_CONFIG" "${ZRAM_CONFIG}.zilla-backup"
-    fi
-
-    # Update the target size BEFORE stopping/restarting the service.
-    # Preserve ALGO, PRIORITY and other existing settings.
+    # Write the new target BEFORE restarting the service.
     set_config_value "PERCENT" "$percent" "$ZRAM_CONFIG"
 
-    info "Requested ZRAM size: ${size_gb} GB (PERCENT=${percent})."
+    info "Setting ZRAM to ${percent}% of system RAM."
 
-    # Disable any active ZRAM swap devices first.
-    while read -r dev; do
-        [[ "$dev" == /dev/zram* ]] || continue
+    # Turn off ZRAM swap safely before stopping its service.
+    while read -r device; do
+        [[ "$device" =~ (^|/)zram[0-9]+$ ]] || continue
 
-        active=0
-        if swapon --noheadings --raw --output=NAME 2>/dev/null |
-            grep -Fxq "$dev"; then
-            active=1
+        if ! swapoff "$device"; then
+            error "Could not disable $device."
+            error "ZRAM configuration saved, but service was not restarted."
+            return 1
         fi
+    done < <(
+        swapon --noheadings --raw --output=NAME 2>/dev/null || true
+    )
 
-        if (( active )); then
-            info "Disabling active ZRAM swap: $dev"
-            if ! swapoff "$dev"; then
-                error "Could not disable $dev."
-                error "The ZRAM service was not restarted."
-                return 1
-            fi
-        fi
-    done < <(zramctl --noheadings --raw --output=NAME 2>/dev/null || true)
+    info "Stopping zramswap..."
 
-    # The service may remove /dev/zram0 when stopped. That is normal.
-    # Never unconditionally reset a device that may no longer exist.
-    info "Stopping zramswap service..."
-    if ! systemctl stop zramswap; then
-        warn "Service stop returned an error; checking device state."
-    fi
+    # zramswap may remove /dev/zram0 itself. That is normal.
+    systemctl stop zramswap || warn "Service stop returned an error."
 
-    # Ensure no ZRAM device is still being used as swap.
-    if swapon --noheadings --raw --output=NAME 2>/dev/null |
-        grep -Eq '^/dev/zram[0-9]+'; then
-        error "A ZRAM device is still active after stopping the service."
-        error "Not starting another ZRAM device to avoid conflicts."
+    if zram_swap_active; then
+        error "ZRAM swap is still active. Aborting restart."
+        swapon --show
         return 1
     fi
 
-    # If the service left an inactive device behind, reset it only
-    # while it still exists. If it disappeared, simply continue.
-    for sysdev in /sys/block/zram*; do
-        [[ -e "$sysdev/disksize" ]] || continue
+    # Reset only devices that STILL exist after the service stops.
+    # Never reset a device that the service has already removed.
+    for device in /sys/block/zram[0-9]*; do
+        [[ -e "$device/disksize" ]] || continue
 
-        dev="/dev/${sysdev##*/}"
+        local dev="/dev/${device##*/}"
 
         if [[ -b "$dev" ]]; then
             if ! zramctl --reset "$dev"; then
-                # The service/device may have disappeared meanwhile.
-                if [[ -e "$sysdev/disksize" && -b "$dev" ]]; then
+                if [[ -e "$device/disksize" && -b "$dev" ]]; then
                     error "Could not reset existing inactive device $dev."
-                    error "Inspect: zramctl; journalctl -u zramswap -n 50"
+                    error "Check zramctl and the zramswap service logs."
                     return 1
                 fi
             fi
@@ -277,30 +257,65 @@ configure_zram_gb() {
 
     systemctl enable zramswap >/dev/null 2>&1 || true
 
-    info "Starting zramswap with the new configuration..."
+    info "Starting zramswap with the updated configuration..."
+
     if ! systemctl start zramswap; then
-        error "Could not start zramswap."
-        journalctl -u zramswap -n 30 --no-pager || true
+        error "zramswap failed to start."
+        journalctl -u zramswap -n 40 --no-pager || true
         return 1
     fi
 
-    # Confirm the service created an active ZRAM swap device.
-    if ! swapon --noheadings --raw --output=NAME 2>/dev/null |
-        grep -Eq '^/dev/zram[0-9]+'; then
-        error "zramswap started, but no active ZRAM swap was found."
-        journalctl -u zramswap -n 30 --no-pager || true
+    # Check the actual device and active swap independently.
+    # Do not rely on the systemd service's active/exited status.
+    if ! zram_device_exists; then
+        error "Service finished, but no ZRAM device exists."
+        journalctl -u zramswap -n 40 --no-pager || true
         return 1
     fi
 
-    success "ZRAM configured and activated."
+    if ! zram_swap_active; then
+        error "ZRAM device exists but is not active as swap."
+        zramctl || true
+        swapon --show || true
+        journalctl -u zramswap -n 40 --no-pager || true
+        return 1
+    fi
+
+    success "ZRAM configured and active."
     zramctl || true
+    swapon --show
+}
+
+configure_zram_size_gb() {
+    local size_gb="$1"
+    local ram_kb percent
+
+    if ! [[ "$size_gb" =~ ^[0-9]+$ ]] ||
+       (( size_gb < 1 || size_gb > 4096 )); then
+        error "ZRAM size must be between 1 and 4096 GB."
+        return 1
+    fi
+
+    ram_kb=$(get_ram_kb)
+
+    if [[ -z "$ram_kb" ]] || (( ram_kb < 1 )); then
+        error "Could not determine physical RAM."
+        return 1
+    fi
+
+    # PERCENT represents a percentage of physical RAM.
+    # Round upward to avoid rounding below the requested size.
+    percent=$(( (size_gb * 104857600 + ram_kb - 1) / ram_kb ))
+
+    (( percent < 1 )) && percent=1
+
+    configure_zram_percent "$percent"
 }
 
 show_status() {
     echo
     echo "========== ZILLA GOAT STATUS =========="
     echo
-
     echo "--- Memory ---"
     free -h || true
 
@@ -319,7 +334,7 @@ show_status() {
     echo
     echo "--- ZRAM Configuration ---"
     if [[ -f "$ZRAM_CONFIG" ]]; then
-        grep -E '^[[:space:]]*(ALGO|PERCENT|PRIORITY)=' \
+        grep -E '^[[:space:]]*(ALGO|PERCENT|SIZE|PRIORITY)=' \
             "$ZRAM_CONFIG" || true
     else
         echo "zram-tools configuration not found."
@@ -338,7 +353,7 @@ ask_number() {
 
         if [[ "$result" =~ ^[0-9]+$ ]]; then
             REPLY="$result"
-            return 0
+            return
         fi
 
         warn "Enter a whole number."
@@ -349,15 +364,14 @@ auto_optimize() {
     local ram_kb disk_gb
 
     ram_kb=$(get_ram_kb)
-    disk_gb=$(( (ram_kb + 2097152 - 1) / 2097152 ))
-
+    disk_gb=$(( (ram_kb + 2097151) / 2097152 ))
     (( disk_gb < 1 )) && disk_gb=1
 
     echo
-    info "Automatic configuration:"
-    info "Disk swap: ${disk_gb} GB (approximately 50% of RAM)"
-    info "ZRAM: 50% of RAM"
-    info "Swappiness: 150"
+    echo "Automatic configuration:"
+    echo "  Disk swap: approximately 50% of RAM (${disk_gb} GB)"
+    echo "  ZRAM: 50% of RAM"
+    echo "  Swappiness: 150"
     echo
 
     read -r -p "Continue? [y/N]: " answer
@@ -365,48 +379,31 @@ auto_optimize() {
 
     configure_disk_swap "$disk_gb" || return 1
     configure_swappiness 150 || return 1
-
-    # Set ZRAM to approximately 50% of physical RAM.
-    # PERCENT is the native setting understood by zram-tools.
-    install_zram_tools
-    if [[ -f "$ZRAM_CONFIG" ]]; then
-        cp -a "$ZRAM_CONFIG" "${ZRAM_CONFIG}.zilla-backup"
-    fi
-    set_config_value "PERCENT" 50 "$ZRAM_CONFIG"
-
-    # Convert the 50%-of-RAM target into an integer GB request
-    # for the common configuration path.
-    local zram_gb
-    zram_gb=$(( (ram_kb + 1048575) / 2097152 ))
-    (( zram_gb < 1 )) && zram_gb=1
-
-    configure_zram_gb "$zram_gb"
+    configure_zram_percent 50
 }
 
 custom_optimize() {
-    local disk_gb swapness
+    local disk_gb swappiness
 
     echo
-    echo "Enter 0 at the first prompt to return."
-    ask_number "Disk swap size in GB: "
+    ask_number "Disk swap size in GB (0 to cancel): "
     disk_gb="$REPLY"
-
     (( disk_gb == 0 )) && return 0
 
     ask_number "Swappiness (0-200): "
-    swapness="$REPLY"
+    swappiness="$REPLY"
 
-    if (( swapness > 200 )); then
+    if (( swappiness > 200 )); then
         error "Swappiness must be between 0 and 200."
         return 1
     fi
 
     configure_disk_swap "$disk_gb" || return 1
-    configure_swappiness "$swapness"
+    configure_swappiness "$swappiness"
 }
 
 manual_menu() {
-    local choice size value
+    local choice value
 
     while true; do
         echo
@@ -423,28 +420,28 @@ manual_menu() {
         case "$choice" in
             1)
                 ask_number "Disk swap size in GB (0 to return): "
-                size="$REPLY"
-                (( size == 0 )) && continue
-                configure_disk_swap "$size" || true
+                value="$REPLY"
+                (( value == 0 )) && continue
+                configure_disk_swap "$value" || true
                 pause
                 ;;
             2)
-                ask_number "Swappiness 0-200 (0 to return): "
-                value="$REPLY"
-                (( value == 0 )) && continue
+                read -r -p "Swappiness 0-200 (q to cancel): " value
+                [[ "${value,,}" == "q" ]] && continue
 
-                if (( value > 200 )); then
-                    error "Swappiness must be between 0 and 200."
-                else
+                if [[ "$value" =~ ^[0-9]+$ ]] &&
+                   (( value <= 200 )); then
                     configure_swappiness "$value" || true
+                else
+                    error "Enter a number from 0 to 200."
                 fi
                 pause
                 ;;
             3)
                 ask_number "ZRAM size in GB (0 to return): "
-                size="$REPLY"
-                (( size == 0 )) && continue
-                configure_zram_gb "$size" || true
+                value="$REPLY"
+                (( value == 0 )) && continue
+                configure_zram_size_gb "$value" || true
                 pause
                 ;;
             4)
